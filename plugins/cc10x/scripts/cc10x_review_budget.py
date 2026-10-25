@@ -818,6 +818,34 @@ def _write(path: Path, data: dict) -> None:
             os.unlink(name)
 
 
+def _projection_result(artifact: dict, ledger: dict, subject: str, path: Path) -> dict:
+    """Return recoverable accounting without claiming unsupported closure."""
+    projection = _projection(ledger, subject, str(path))
+    reasons = validate_budget_projection(dict(artifact, review_budget=projection), ledger)
+    if reasons and not (reasons == ["fresh_pass_required"] and ledger["opening"]["source_refs"]):
+        raise BudgetError(reasons[0], "blocked")
+    return dict(status="blocked" if reasons else "allowed", reasons=reasons,
+                projection=projection, ledger_revision=ledger["revision"])
+
+
+def _fresh_proof_operation(ledger: dict, request: dict) -> bool:
+    """Admission only: the evaluator still checks identity, proof and funding."""
+    if not ledger["opening"]["source_refs"]:
+        return False
+    op = request.get("op")
+    if op == "checkpoint":
+        return True  # No dispatch or spending; existing checkpoint gates apply.
+    if op == "extend":
+        return (request.get("authorization_scope", {}).get("lanes") == ["fresh"] and
+                set(request.get("lane_increments", {})) <= {"fresh"})
+    if op == "reserve":
+        return request.get("lane") == "fresh"
+    if op == "finish":
+        return any(event["attempt_id"] == request.get("attempt_id") and event["lane"] == "fresh"
+                   for event in _events(ledger, "attempt_reserved"))
+    return False
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-root", type=Path, default=None)
@@ -848,7 +876,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ledger = _read(path)
                 _validate_ledger(ledger)
                 reasons = validate_budget_projection(source, ledger)
-                if reasons and reasons != ["projection_stale"]:
+                if reasons == ["projection_stale"]:
+                    current = _projection(ledger, source["review_budget"]["subject_id"], str(path))
+                    reasons = validate_budget_projection(dict(source, review_budget=current), ledger)
+                if reasons:
                     raise BudgetError("invalid_source", "blocked")
                 subject = _id(request.get("subject_id", source_mirror["subject_id"]))
                 if subject != source_mirror["subject_id"]:
@@ -875,7 +906,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if destination["review_budget"].get("ledger_path") != str(path):
                     raise BudgetError("membership_mismatch")
                 reasons = validate_budget_projection(destination, proposed)
-                if reasons and reasons != ["projection_stale"]:
+                if reasons == ["projection_stale"]:
+                    current = _projection(proposed, destination["review_budget"]["subject_id"], str(path))
+                    reasons = validate_budget_projection(dict(destination, review_budget=current), proposed)
+                if reasons:
                     raise BudgetError("accounting_conflict", "blocked")
                 ledger = proposed
                 if not existing:
@@ -900,10 +934,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 reasons = validate_budget_projection(artifact, ledger)
                 result.update(projection=_projection(ledger, mirror["subject_id"], str(path)),
                               ledger_revision=ledger["revision"])
-                if reasons and not (request["op"] == "reconcile" and reasons == ["projection_stale"]):
+                if reasons and not (
+                        request["op"] == "reconcile" and reasons == ["projection_stale"] or
+                        reasons == ["fresh_pass_required"] and _fresh_proof_operation(ledger, request)):
                     raise BudgetError(reasons[0], "blocked")
                 if request["op"] in ("inspect", "reconcile"):
-                    result.update(status="allowed")
+                    result.update(_projection_result(artifact, ledger, mirror["subject_id"], path))
                 else:
                     if request.get("workflow_uuid") != workflow_uuid:
                         raise BudgetError("membership_mismatch")
@@ -939,16 +975,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if (_has_evidence(artifact.get("results")) and not ids and
                         not ledger["opening"]["source_refs"]):
                     raise BudgetError("migration_required", "blocked")
-                projection = _projection(ledger, subject, str(path))
-                artifact["review_budget"] = projection
-                reasons = validate_budget_projection(artifact, ledger)
-                if reasons:
-                    raise BudgetError(reasons[0], "blocked")
                 # Retry only returns the committed state. Policy/migration in
                 # the request cannot rewrite an existing ledger or its funding.
-                result.update(status="allowed", projection=projection, ledger_revision=ledger["revision"])
+                result.update(_projection_result(artifact, ledger, subject, path))
                 print(json.dumps(result, allow_nan=False))
-                return 0
+                return 0 if result["status"] == "allowed" else 2
             policy = DEFAULT_POLICY.copy()
             policy.update(request.get("policy", {}))
             opening = dict(charged_units=0, counts={}, coverage="complete", source_refs=[])
@@ -965,9 +996,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                                         source_workflow_uuid=None)],
                           opening=opening)
             _validate_ledger(ledger)
-            projection = _projection(ledger, subject, str(path))
+            initialized = _projection_result(artifact, ledger, subject, path)
             _write(path, ledger)
-            result.update(status="allowed", projection=projection, ledger_revision=1)
+            result.update(initialized)
     except BudgetError as exc:
         result.update(status=exc.status, reasons=[exc.reason])
         result.pop("dispatch", None)

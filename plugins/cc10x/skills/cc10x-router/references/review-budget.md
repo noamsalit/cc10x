@@ -101,6 +101,23 @@ only an authorized finite grant can continue it. Unknown metrics on an otherwise
 complete v1 ledger do not imply unknown invocation history. Ambiguous unfinished
 legacy node mapping blocks. Never synthesize a fresh PASS from scalar counts.
 
+An imported historical `planning_review_status: passed` is provenance, not a new
+ledger fresh PASS. When that is the sole unresolved check, `init` (including
+retry recovery) persists/returns the accounting projection with exit 2 and
+`fresh_pass_required`. Copy this projection even though closure is blocked;
+preserve the historical status, revisions, decisions and receipts. Stale-mirror
+`reconcile` also returns the current projection without claiming closure.
+For an imported opening with source references, this single reason permits only
+checkpoints, finite grants scoped exclusively to `fresh`, fresh review
+reservations, and completion of those fresh attempts. All normal identity,
+scope, input/proof, funding and lane checks still apply. Exhausted funds/slots
+need an applicable scoped grant; historical permissions are not new grants.
+Bind `plan_input_digest` to the actual current review input before dispatch.
+Ordinary work, amendment reviews and joins stay blocked; inspect/replay still
+report the closure failure until a genuine current fresh PASS is recorded.
+Invalid/FINDINGS/amendment results or changed revision/input never satisfy it.
+This path neither erases the original approval nor fabricates its execution.
+
 ## Dispatch and result ingestion
 
 1. Read the exact workflow, ledger, current tasks and event evidence. Resolve

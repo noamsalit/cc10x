@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import subprocess
 import shutil
 import sys
@@ -19,14 +20,15 @@ def digest(value):
 
 
 class Client:
-    def __init__(self, root):
+    def __init__(self, root, artifact=None, initialize=True):
         self.root = root / ".cc10x"
         self.workflow = self.root / "workflows" / "wf-a.json"
         self.workflow.parent.mkdir(parents=True)
-        self.workflow.write_text(json.dumps({"workflow_uuid": "wf-a"}))
+        self.workflow.write_text(json.dumps(artifact or {"workflow_uuid": "wf-a"}))
         self.serial = 0
         self.reservations = {}
-        self.call(dict(op="init", lineage_id="lineage-a", subject_id="subject-a"))
+        if initialize:
+            self.call(dict(op="init", lineage_id="lineage-a", subject_id="subject-a"))
 
     def call(self, request, expected=0, project=True):
         self.serial += 1
@@ -133,6 +135,209 @@ def test_remfix4_specialized_remediation_does_not_expand_other_roles_or_lanes(tm
     result = client.call(client.reserve(role=role, lane=lane), 3)
     assert result["reasons"] == ["role_lane_mismatch"]
     assert path.read_bytes() == before
+
+
+def legacy_review_client(tmp_path, passed=True):
+    artifact = json.loads((SCRIPT.parent.parent / "skills/cc10x-router/references/workflow-artifact.skeleton.json").read_text())
+    artifact.update(workflow_uuid="wf-a", workflow_id="wf-a", workflow_type="BUILD", phase_cursor="build-implement",
+                    planning_review_runs=3, plan_revision=3,
+                    last_reviewed_revision=3, plan_input_digest=None,
+                    planning_review_status="passed" if passed else "pending",
+                    remediation_history=[dict(cycle_number=i) for i in range(1, 5)])
+    return Client(tmp_path, artifact=artifact, initialize=False)
+
+
+def legacy_replay(client, expected):
+    root = SCRIPT.parents[3]
+    run = subprocess.run([sys.executable, str(root / "plugins/cc10x/tools/workflow_replay_check.py"),
+                          "--artifact", str(client.workflow)], capture_output=True, text=True,
+                         env=dict(os.environ, CC10X_REPO_ROOT=str(root)))
+    assert run.returncode == expected, run.stdout + run.stderr
+    if expected:
+        assert "fresh_pass_required" in run.stderr
+
+
+def legacy_import_request():
+    return dict(op="init", lineage_id="lineage-a", subject_id="subject-a",
+                migration=dict(coverage="unknown", charged_units=32, source_refs=["review-history", "repair-history"],
+                               counts={"subject-a": dict(attempts=7, fresh_valid=3, remediation_attempts=4)}))
+
+
+def projected_legacy_review(tmp_path):
+    # Real migration without closure, then attach the historical passed claim:
+    # equivalent to an already-projected ledger from an older CLI version.
+    client = legacy_review_client(tmp_path, passed=False)
+    client.call(legacy_import_request())
+    artifact = json.loads(client.workflow.read_text())
+    artifact["planning_review_status"] = "passed"
+    client.workflow.write_text(json.dumps(artifact))
+    return client
+
+
+def legacy_review_checkpoint(client, name="review-checkpoint"):
+    p = client.call(dict(op="inspect"), 2)["projection"]
+    return dict(op="checkpoint", event_id="event-" + name, checkpoint_id=name,
+                workflow_uuid="wf-a", subject_id="subject-a", recorded_at="2026-01-01T00:00:02Z",
+                action="needs_authorization", observed_revision=p["ledger_revision"],
+                scope_digest=digest("scope"), input_digest=digest("input"), finding_ids=[], proof_refs=[],
+                changed_input_refs=[dict(ref="current-plan", digest=digest("current-plan"))],
+                progress="finite_fix", reopened_ids=[], scope_change="none",
+                rationale="Obtain genuine current fresh review", remaining_units=p["remaining_units"])
+
+
+def legacy_review_grant():
+    return grant(checkpoint_id="review-checkpoint", lane_increments={"fresh": 1},
+                 authorization_scope=dict(subject_id="subject-a", lanes=["fresh"], scope_digest=digest("scope")))
+
+
+def funded_legacy_review(client):
+    client.call(legacy_review_checkpoint(client))
+    client.call(legacy_review_grant())
+    checks = [dict(grant_id="g", applicable=True, evidence_ref="decision-a", evidence_digest=digest("authority"))]
+    request = client.reserve("fresh-review", role="plan-gap-reviewer", lane="fresh", authorization_checks=checks)
+    artifact = json.loads(client.workflow.read_text())
+    artifact["plan_input_digest"] = request["input_digest"]
+    client.workflow.write_text(json.dumps(artifact))
+    client.call(request)
+    return request
+
+
+def test_legacy_closure_migration_reports_pending_proof_and_recovers_projection(tmp_path):
+    client = legacy_review_client(tmp_path)
+    original = client.workflow.read_bytes()
+    result = client.call(legacy_import_request(), 2)
+    assert result["reasons"] == ["fresh_pass_required"]
+    p = result["projection"]
+    assert (p["counts"]["fresh_valid"], p["counts"]["remediation_attempts"], p["charged_units"], p["remaining_units"]) == (3, 4, 32, 0)
+    path = Path(p["ledger_path"])
+    before = path.read_bytes()
+    assert json.loads(before)["events"] == [] and client.workflow.read_bytes() == original
+    recovered = client.call(dict(op="init", lineage_id="lineage-a", subject_id="subject-a"), 2)
+    assert recovered["projection"] == p and path.read_bytes() == before
+    artifact = json.loads(original)
+    artifact["review_budget"] = p
+    client.workflow.write_text(json.dumps(artifact))
+    assert client.call(dict(op="inspect"), 2)["reasons"] == ["fresh_pass_required"]
+    legacy_replay(client, 1)
+    assert client.call(client.reserve("work"), 2)["reasons"] == ["fresh_pass_required"]
+    assert client.call(client.reserve("review", role="plan-gap-reviewer", lane="fresh"), 2)["reasons"] == ["insufficient_eligible_units"]
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("prior_digest", [None, "known"])
+def test_legacy_closure_genuine_funded_fresh_review_unlocks_without_reset(tmp_path, prior_digest):
+    import cc10x_review_budget as budget
+    client = projected_legacy_review(tmp_path)
+    artifact = json.loads(client.workflow.read_text())
+    artifact["plan_input_digest"] = digest(prior_digest) if prior_digest else None
+    client.workflow.write_text(json.dumps(artifact))
+    history = artifact["remediation_history"]
+    legacy_replay(client, 1)
+    request = funded_legacy_review(client)
+    client.call(client.finish("fresh-review", "valid", contract_ref="fresh-contract", contract_digest=digest("contract"),
+                              verdict="PASS", review_mode="fresh", reviewed_revision=3))
+    p = client.call(dict(op="inspect"))["projection"]
+    assert (p["counts"]["attempts"], p["counts"]["fresh_valid"], p["counts"]["remediation_attempts"], p["charged_units"], p["remaining_units"]) == (8, 4, 4, 33, 7)
+    artifact = json.loads(client.workflow.read_text())
+    ledger = json.loads(Path(p["ledger_path"]).read_text())
+    assert artifact["planning_review_status"] == "passed" and artifact["remediation_history"] == history
+    assert ledger["opening"]["charged_units"] == 32 and ledger["opening"]["coverage"] == "unknown"
+    assert budget.validate_budget_projection(artifact, ledger) == []
+    legacy_replay(client, 0)
+    source = client.workflow
+    client.workflow = source.with_name("wf-b.json")
+    client.workflow.write_text(json.dumps(dict(workflow_uuid="wf-b")))
+    assert client.call(dict(op="join", source_workflow=str(source)))["projection"]["charged_units"] == 33
+    client.workflow = source
+    client.call(dict(op="reconcile"))
+    artifact = json.loads(source.read_text())
+    artifact["plan_input_digest"] = digest("changed-input")
+    source.write_text(json.dumps(artifact))
+    assert client.call(dict(op="inspect"), 2)["reasons"] == ["fresh_pass_required"]
+    legacy_replay(client, 1)
+    artifact["plan_input_digest"] = request["input_digest"]
+    artifact["plan_revision"] = 4
+    source.write_text(json.dumps(artifact))
+    assert client.call(dict(op="inspect"), 2)["reasons"] == ["fresh_pass_required"]
+
+
+def test_legacy_closure_stale_reconcile_retains_pending_proof(tmp_path):
+    client = projected_legacy_review(tmp_path)
+    client.call(legacy_review_checkpoint(client), project=False)
+    result = client.call(dict(op="reconcile"), 2)
+    assert result["reasons"] == ["fresh_pass_required"] and result["projection"]["ledger_revision"] == 2
+
+
+@pytest.mark.parametrize("side", ["source", "destination"])
+def test_legacy_closure_stale_join_cannot_hide_missing_fresh_proof(tmp_path, side):
+    client = projected_legacy_review(tmp_path) if side == "source" else Client(tmp_path)
+    source = client.workflow
+    destination = source.with_name("wf-b.json")
+    destination.write_text(json.dumps(dict(workflow_uuid="wf-b")))
+    if side == "source":
+        client.call(legacy_review_checkpoint(client), project=False)
+    else:
+        client.workflow = destination
+        client.call(dict(op="join", source_workflow=str(source)))
+        artifact = json.loads(destination.read_text())
+        artifact.update(planning_review_status="passed", plan_revision=3, last_reviewed_revision=3)
+        destination.write_text(json.dumps(artifact))
+        client.workflow = source
+        client.call(dict(op="reconcile"))
+        client.call(client.reserve())
+    path = Path(json.loads(source.read_text())["review_budget"]["ledger_path"])
+    before = path.read_bytes()
+    client.workflow = destination
+    rejected = client.call(dict(op="join", source_workflow=str(source)), 2)
+    assert rejected["reasons"] == ["invalid_source" if side == "source" else "accounting_conflict"]
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("case", ["work", "amendment", "mixed-grant", "foreign-receipt", "foreign-subject"])
+def test_legacy_closure_repair_path_rejects_other_work_or_conflicts(tmp_path, case):
+    client = projected_legacy_review(tmp_path)
+    p = client.call(dict(op="inspect"), 2)["projection"]
+    path = Path(p["ledger_path"])
+    before = path.read_bytes()
+    if case == "mixed-grant":
+        request = legacy_review_grant()
+        request["authorization_scope"]["lanes"].append("work")
+    elif case in ("foreign-receipt", "foreign-subject"):
+        request = legacy_review_checkpoint(client)
+        if case == "foreign-receipt":
+            client.workflow.with_suffix(".events.jsonl").write_text(json.dumps(dict(event="attempt_reserved", attempt_id="unknown")) + "\n")
+        else:
+            request["subject_id"] = "other-subject"
+    else:
+        request = client.reserve("wrong", role="plan-gap-reviewer" if case == "amendment" else "component-builder",
+                                 lane="amendment" if case == "amendment" else "work")
+    result = client.call(request, 3 if case == "foreign-subject" else 2)
+    assert result.get("dispatch") != "new" and path.read_bytes() == before
+
+
+@pytest.mark.parametrize("outcome,verdict,revision", [("invalid", None, None), ("valid", "FINDINGS", 3), ("valid", "PASS", 2)])
+def test_legacy_closure_noncurrent_or_failed_fresh_result_never_closes(tmp_path, outcome, verdict, revision):
+    client = projected_legacy_review(tmp_path)
+    funded_legacy_review(client)
+    finish = client.finish("fresh-review", outcome)
+    if outcome == "valid":
+        finish.update(contract_ref="fresh-contract", contract_digest=digest("contract"), verdict=verdict,
+                      review_mode="fresh", reviewed_revision=revision)
+    client.call(finish)
+    result = client.call(dict(op="inspect"), 2)
+    assert result["reasons"] == ["fresh_pass_required"] and result["projection"]["charged_units"] == 33
+    source = client.workflow
+    client.workflow = source.with_name("wf-b.json")
+    client.workflow.write_text(json.dumps(dict(workflow_uuid="wf-b")))
+    assert client.call(dict(op="join", source_workflow=str(source)), 2)["reasons"] == ["invalid_source"]
+
+
+def test_legacy_closure_no_migration_provenance_does_not_enable_repair_gate(tmp_path):
+    client = Client(tmp_path)
+    artifact = json.loads(client.workflow.read_text())
+    artifact.update(planning_review_status="passed", plan_revision=3, last_reviewed_revision=3)
+    client.workflow.write_text(json.dumps(artifact))
+    assert client.call(legacy_review_checkpoint(client), 2)["reasons"] == ["fresh_pass_required"]
 
 
 def test_reservations_charge_invalid_work_and_replay_once(tmp_path):
