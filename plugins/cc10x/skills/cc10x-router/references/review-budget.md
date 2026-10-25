@@ -113,10 +113,21 @@ reservations, and completion of those fresh attempts. All normal identity,
 scope, input/proof, funding and lane checks still apply. Exhausted funds/slots
 need an applicable scoped grant; historical permissions are not new grants.
 Bind `plan_input_digest` to the actual current review input before dispatch.
-Ordinary work, amendment reviews and joins stay blocked; inspect/replay still
-report the closure failure until a genuine current fresh PASS is recorded.
-Invalid/FINDINGS/amendment results or changed revision/input never satisfy it.
-This path neither erases the original approval nor fabricates its execution.
+While the unsupported historical passed claim is current, ordinary work,
+amendment reviews and joins stay blocked; inspect/replay report the closure
+failure. Only a genuine current fresh PASS satisfies passed closure.
+
+After an actual role-valid fresh FINDINGS for the current revision/input, first
+persist its immutable finish and projection. Preserve historical approval,
+decisions and receipts in existing `status_history`/result evidence; then set
+the current `planning_review_status=findings_received`, current findings and
+reviewed revision/input binding. Re-ingestion must be idempotent. A crash before
+that status update retains the closure conflict and restricted admission;
+recover from the recorded finish. Once honestly `findings_received`, scoped
+planner/repair work can use existing finite grants and reservation checks.
+After editing use `revised_after_review`; BUILD approval still needs current
+fresh PASS. Accounting consistency is not approval. Never clear passed to evade
+proof acquisition or use invalid, amendment or stale results for this transition.
 
 ## Dispatch and result ingestion
 
@@ -170,6 +181,34 @@ subject, matching its valid completion's `evidence_refs`. The producer must be
 the prior node or a declared dependency. Preserve exact covering tests, command,
 output and current tested revision; dispute-only and QA keep their existing proof
 contracts. A sibling's proof is not interchangeable. Proof transfers no funding.
+
+For a malformed role contract only, an optional v1 checkpoint member admits one
+instruction correction per same-node `retry_of` chain:
+`contract_correction={invalid_attempt_id,instruction:{ref,digest}}`. Omit it for
+ordinary retries; null, incomplete objects and extra nested keys are invalid.
+The latest same-node attempt must have a terminal invalid finish with validated
+`contract_ref`/`contract_digest` for the raw malformed output. Diagnose the missing
+contract requirement in the parent rationale, and put that receipt pair plus the
+instruction pair in `changed_input_refs`. Neither is execution proof.
+
+Name that exact invalid attempt in `retry_of`. Preserve node, subject, lane,
+scope and dependency IDs; retain every prior input pair and add exactly the
+named, previously absent instruction pair. The instruction supplies only the
+missing contract requirement. Raw malformed output and prior findings stay out
+of fresh reviewer input. Parent checks semantic narrowness and proof relevance.
+Use a matching `continue` checkpoint with non-none progress and safe scope;
+reservation requires ledger revision = observed_revision + 1. Obtain grants
+before this checkpoint; any intervening mutation stales it.
+
+Retain all proof refs from the invalid attempt's prior checkpoint and validate
+their producer/dependency/digest and current relevance normally. Only an invalid
+initial review without inherited proof obligation may use empty proofs. Ordinary
+retries, valid findings, cancellation and loss still need covering proof. A second
+malformed result cannot reuse the exception, even with a different instruction.
+Reserve and charge normally; invalid results refund nothing and earn no review
+credit. Fresh/code invalid results release only held review slots; amendment
+attempts stay consumed. Existing stricter retry caps remain. Bind the corrected
+current plan input before fresh dispatch: an old-input PASS cannot close it.
 
 At a finite boundary, eligible progress produces `needs_authorization`; without
 applicable recorded authority, stop with one finite proposal. Existing standing

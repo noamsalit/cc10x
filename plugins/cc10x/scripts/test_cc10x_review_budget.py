@@ -137,6 +137,262 @@ def test_remfix4_specialized_remediation_does_not_expand_other_roles_or_lanes(tm
     assert path.read_bytes() == before
 
 
+def correction_requests(client, prior, name="corrected", proof_refs=None, pending=False):
+    instruction = dict(ref="contract-instruction-" + name, digest=digest("Return required role fields " + name))
+    request = dict(prior, event_id="reserve-" + name, attempt_id=name,
+                   retry_of=prior["attempt_id"], checkpoint_id="checkpoint-" + name,
+                   input_refs=prior["input_refs"] + [instruction])
+    request["input_digest"] = digest(dict(scope_digest=request["scope_digest"],
+                                         role=request["node_descriptor"]["role"],
+                                         input_refs=sorted(request["input_refs"], key=lambda r: (r["ref"], r["digest"]))))
+    p = client.call(dict(op="inspect"), 2 if pending else 0)["projection"]
+    cp = dict(op="checkpoint", event_id="event-" + name, checkpoint_id=request["checkpoint_id"],
+              workflow_uuid="wf-a", subject_id="subject-a", recorded_at="2026-01-01T00:00:02Z",
+              action="continue", observed_revision=p["ledger_revision"], scope_digest=prior["scope_digest"],
+              input_digest=request["input_digest"], finding_ids=[], proof_refs=proof_refs or [],
+              changed_input_refs=[dict(ref="malformed-output", digest=digest("malformed-output")), instruction],
+              progress="finite_fix", reopened_ids=[], scope_change="none",
+              rationale="Malformed role fields; add only required contract instructions",
+              remaining_units=p["remaining_units"],
+              contract_correction=dict(invalid_attempt_id=prior["attempt_id"], instruction=instruction))
+    return cp, request
+
+
+def invalid_contract(client, attempt):
+    return client.finish(attempt, contract_ref="malformed-output", contract_digest=digest("malformed-output"))
+
+
+@pytest.mark.parametrize("role,lane,credit,limit", [("plan-gap-reviewer", "fresh", "fresh_valid", 2),
+    ("plan-gap-reviewer", "amendment", "amendment_valid", 3),
+    ("code-reviewer", "code_review", "code_review_valid", 4)])
+def test_contract_correction_cli(tmp_path, role, lane, credit, limit):
+    client = Client(tmp_path)
+    first = client.reserve(role=role, lane=lane)
+    client.call(first)
+    client.call(invalid_contract(client, "a"))
+    cp, retry = correction_requests(client, first)
+    client.call(cp)
+    result = client.call(retry)
+    assert result["dispatch"] == "new"
+    assert (result["projection"]["counts"]["attempts"], result["projection"]["charged_units"],
+            result["projection"]["remaining_units"], result["projection"]["counts"][credit]) == (2, 2, 30, 0)
+    assert client.call(retry)["dispatch"] == "resume"
+    assert client.call(retry)["projection"] == result["projection"]
+    unchanged = dict(retry, event_id="reserve-identical", attempt_id="identical", retry_of="corrected")
+    assert client.call(unchanged, 2)["reasons"] == ["node_unresolved"]
+    client.call(invalid_contract(client, "corrected"))
+    assert client.call(unchanged, 2)["reasons"] == ["unchanged_input"]
+    second_cp, _ = correction_requests(client, retry, "second-correction")
+    assert client.call(second_cp, 2)["reasons"] == ["contract_correction_used"]
+    # Failed fresh/code reviews release their slots; amendment attempts consume them.
+    available = limit - (2 if lane == "amendment" else 0)
+    for n in range(available):
+        client.call(client.reserve("slot-%s" % n, role=role, lane=lane, source="slot-%s" % n))
+    assert client.call(client.reserve("overflow", role=role, lane=lane, source="overflow"), 2)["reasons"] == ["lane_limit"]
+
+
+@pytest.mark.parametrize("case,reason,exit_code", [
+    ("null", "invalid_contract_correction", 3), ("empty", "invalid_contract_correction", 3),
+    ("extra", "invalid_contract_correction", 3), ("instruction-extra", "invalid_contract_correction", 3),
+    ("missing-receipt", "invalid_text", 3), ("bad-receipt", "invalid_digest", 3),
+    ("wrong-receipt", "contract_correction_evidence", 2),
+    ("missing-instruction", "contract_correction_evidence", 2),
+    ("unknown-attempt", "contract_correction_attempt", 2),
+    ("cancelled", "contract_correction_outcome", 2), ("lost", "contract_correction_outcome", 2),
+    ("valid", "contract_correction_outcome", 2), ("unresolved", "contract_correction_outcome", 2),
+    ("unsafe", "progress_stop", 2), ("no-progress", "progress_stop", 2),
+])
+def test_contract_correction_checkpoint_controls(tmp_path, case, reason, exit_code):
+    client = Client(tmp_path)
+    first = client.reserve(role="plan-gap-reviewer", lane="fresh")
+    client.call(first)
+    finish = invalid_contract(client, "a")
+    if case in ("cancelled", "lost", "valid"):
+        finish.update(outcome=case, verdict="FINDINGS", review_mode="fresh", reviewed_revision=1)
+    if case == "missing-receipt":
+        finish.update(contract_ref=None, contract_digest=None)
+    if case == "bad-receipt":
+        finish["contract_digest"] = "bad"
+    if case != "unresolved":
+        client.call(finish)
+    cp, _ = correction_requests(client, first)
+    if case in ("null", "empty"):
+        cp["contract_correction"] = None if case == "null" else {}
+    if case == "extra":
+        cp["contract_correction"]["extra"] = True
+    if case == "instruction-extra":
+        cp["contract_correction"]["instruction"]["extra"] = True
+    if case == "wrong-receipt":
+        cp["changed_input_refs"][0]["digest"] = digest("other")
+    if case == "missing-instruction":
+        cp["changed_input_refs"] = cp["changed_input_refs"][:1]
+    if case == "unknown-attempt":
+        cp["contract_correction"]["invalid_attempt_id"] = "unknown"
+    if case == "unsafe":
+        cp["scope_change"] = "security"
+    if case == "no-progress":
+        cp["progress"] = "none"
+    path = Path(client.call(dict(op="inspect"))["projection"]["ledger_path"])
+    before = path.read_bytes()
+    assert client.call(cp, exit_code)["reasons"] == [reason]
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("case,reason", [
+    ("changed-content", "contract_correction_input"), ("extra-input", "contract_correction_input"),
+    ("wrong-instruction", "contract_correction_input"), ("scope", "contract_correction_identity"),
+    ("dependencies", "contract_correction_identity"), ("lane", "contract_correction_identity"),
+    ("node", "contract_correction_identity"), ("wrong-retry", "invalid_retry"),
+    ("stale", "stale_checkpoint"),
+])
+def test_contract_correction_reservation_controls(tmp_path, case, reason):
+    client = Client(tmp_path)
+    first = client.reserve(role="plan-gap-reviewer", lane="fresh")
+    client.call(first)
+    client.call(invalid_contract(client, "a"))
+    cp, retry = correction_requests(client, first)
+    if case == "changed-content":
+        retry["input_refs"] = [dict(ref="content", digest=digest("changed"))] + retry["input_refs"][1:]
+    if case == "extra-input":
+        retry["input_refs"] += [dict(ref="extra", digest=digest("extra"))]
+    if case == "wrong-instruction":
+        retry["input_refs"] = first["input_refs"] + [dict(ref="other-instruction", digest=digest("other"))]
+    if case == "scope":
+        retry["scope_digest"] = cp["scope_digest"] = digest("new-scope")
+    if case == "dependencies":
+        retry["dependency_node_ids"] = [digest("new-dependency")]
+    if case == "lane":
+        retry["lane"] = "amendment"
+    if case == "node":
+        retry["node_descriptor"] = dict(retry["node_descriptor"], step_key="other")
+        retry["node_id"] = digest(retry["node_descriptor"])
+    if case == "wrong-retry":
+        retry["retry_of"] = "other"
+    retry["input_digest"] = cp["input_digest"] = digest(dict(scope_digest=retry["scope_digest"],
+        role=retry["node_descriptor"]["role"], input_refs=sorted(retry["input_refs"], key=lambda r: (r["ref"], r["digest"]))))
+    # Scope admission is checked against the invalid attempt at checkpoint time.
+    if case == "scope":
+        assert client.call(cp, 2)["reasons"] == [reason]
+        return
+    client.call(cp)
+    if case == "stale":
+        client.call(client.reserve("intervening", source="intervening"))
+    path = Path(client.call(dict(op="inspect"))["projection"]["ledger_path"])
+    before = path.read_bytes()
+    result = client.call(retry, 3 if case == "wrong-retry" else 2)
+    assert result["reasons"] == [reason]
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("outcome", ["valid", "cancelled", "lost", "invalid"])
+def test_contract_correction_absent_retains_ordinary_proof_gate(tmp_path, outcome):
+    client = Client(tmp_path)
+    first = client.reserve(role="plan-gap-reviewer", lane="fresh")
+    client.call(first)
+    client.call(client.finish(outcome=outcome, contract_ref="contract", contract_digest=digest("contract"),
+                              verdict="FINDINGS", review_mode="fresh", reviewed_revision=1))
+    cp, retry = correction_requests(client, first)
+    del cp["contract_correction"]
+    client.call(cp)
+    assert client.call(retry, 2)["reasons"] == ["covering_proof_required"]
+
+
+@pytest.mark.parametrize("eligible", [False, True])
+def test_contract_correction_still_requires_eligible_funds(tmp_path, eligible):
+    client = Client(tmp_path)
+    first = client.reserve(role="plan-gap-reviewer", lane="fresh")
+    client.call(first)
+    client.call(invalid_contract(client, "a"))
+    for n in range(31):
+        client.call(client.reserve("work-%s" % n, source="source-%s" % n))
+    cp, retry = correction_requests(client, first)
+    client.call(cp)
+    assert client.call(retry, 2)["reasons"] == ["insufficient_eligible_units"]
+    client.call(checkpoint(client, "funds"))
+    client.call(grant("funding", "funds", authorization_scope=dict(subject_id="subject-a",
+                     lanes=["fresh"] if eligible else ["remediation"], scope_digest=digest("scope"))))
+    # A grant after a correction checkpoint makes that checkpoint stale.
+    assert client.call(retry, 2)["reasons"] == ["stale_checkpoint"]
+    cp, retry = correction_requests(client, first, "funded-correction")
+    retry["authorization_checks"] = [dict(grant_id="funding", applicable=True,
+        evidence_ref="decision-a", evidence_digest=digest("authority"))]
+    client.call(cp)
+    result = client.call(retry, 0 if eligible else 2)
+    if eligible:
+        assert (result["projection"]["charged_units"], result["projection"]["remaining_units"]) == (33, 7)
+    else:
+        assert result["reasons"] == ["insufficient_eligible_units"]
+        assert result["projection"]["remaining_units"] == 8
+
+
+@pytest.mark.parametrize("case", ["existing-pair-with-metadata", "raw-receipt-as-instruction"])
+def test_contract_correction_instruction_is_new_and_separate(tmp_path, case):
+    client = Client(tmp_path)
+    first = client.reserve(role="plan-gap-reviewer", lane="fresh")
+    if case == "existing-pair-with-metadata":
+        refs = first["input_refs"] + [dict(ref="contract-instruction-corrected",
+            digest=digest("Return required role fields corrected"), input_digest=digest("context"))]
+        first = client.reserve(role="plan-gap-reviewer", lane="fresh", input_refs=refs)
+    client.call(first)
+    client.call(invalid_contract(client, "a"))
+    cp, _ = correction_requests(client, first)
+    if case == "raw-receipt-as-instruction":
+        cp["contract_correction"]["instruction"] = cp["changed_input_refs"][0]
+    assert client.call(cp, 2)["reasons"] == ["contract_correction_evidence"]
+
+
+def test_contract_correction_findings_never_close(tmp_path):
+    client = Client(tmp_path, artifact=dict(workflow_uuid="wf-a", plan_revision=1,
+                                          planning_review_status="pending"))
+    request = client.reserve(role="plan-gap-reviewer", lane="fresh")
+    client.call(request)
+    client.call(client.finish(outcome="valid", contract_ref="review", contract_digest=digest("review"),
+                              verdict="FINDINGS", review_mode="fresh", reviewed_revision=1))
+    artifact = json.loads(client.workflow.read_text())
+    artifact.update(plan_input_digest=request["input_digest"], planning_review_status="passed")
+    client.workflow.write_text(json.dumps(artifact))
+    assert client.call(dict(op="inspect"), 2)["reasons"] == ["fresh_pass_required"]
+
+
+def repair_proof(client, attempt="repair"):
+    request = client.reserve(attempt, source=attempt, lane="remediation")
+    client.call(request)
+    evidence = dict(ref="covering-tests", digest=digest("tested-output"), input_digest=request["input_digest"])
+    client.call(client.finish(attempt, "valid", contract_ref="repair-contract", contract_digest=digest("repair"),
+                              evidence_refs=[evidence]))
+    return dict(**evidence, producer_attempt_id=attempt, producer_node_id=request["node_id"], subject_id="subject-a")
+
+
+@pytest.mark.parametrize("case", ["retained", "missing", "wrong-producer", "stale-digest"])
+def test_contract_correction_preserves_covering_proof(tmp_path, case):
+    client = Client(tmp_path)
+    proof = repair_proof(client)
+    first = client.reserve(role="plan-gap-reviewer", lane="fresh", dependency_node_ids=[proof["producer_node_id"]])
+    client.call(first)
+    client.call(client.finish(outcome="valid", contract_ref="review", contract_digest=digest("review"),
+                              verdict="FINDINGS", review_mode="fresh", reviewed_revision=1))
+    second = client.reserve("review-two", role="plan-gap-reviewer", lane="fresh", retry_of="a", content="repaired",
+                            dependency_node_ids=first["dependency_node_ids"], checkpoint_id="repair-proof")
+    client.call(checkpoint(client, "repair-proof", action="continue", input_digest=second["input_digest"], proof_refs=[proof]))
+    client.call(second)
+    client.call(invalid_contract(client, "review-two"))
+    cp, retry = correction_requests(client, second, proof_refs=[dict(proof)])
+    if case == "missing":
+        cp["proof_refs"] = []
+    if case == "wrong-producer":
+        cp["proof_refs"][0]["producer_node_id"] = digest("wrong")
+    if case == "stale-digest":
+        cp["proof_refs"][0]["digest"] = digest("stale")
+    if case != "retained":
+        reason = {"missing": "covering_proof_required", "wrong-producer": "proof_producer_mismatch",
+                  "stale-digest": "stale_or_invalid_proof"}[case]
+        assert client.call(cp, 2)["reasons"] == [reason]
+    else:
+        client.call(cp)
+        p = client.call(retry)["projection"]
+        assert (p["charged_units"], p["counts"]["fresh_valid"]) == (4, 1)
+
+
 def legacy_review_client(tmp_path, passed=True):
     artifact = json.loads((SCRIPT.parent.parent / "skills/cc10x-router/references/workflow-artifact.skeleton.json").read_text())
     artifact.update(workflow_uuid="wf-a", workflow_id="wf-a", workflow_type="BUILD", phase_cursor="build-implement",
@@ -200,6 +456,102 @@ def funded_legacy_review(client):
     client.workflow.write_text(json.dumps(artifact))
     client.call(request)
     return request
+
+
+@pytest.mark.parametrize("correct_contract", [False, True])
+def test_legacy_findings_recovery_cli(tmp_path, correct_contract):
+    client = legacy_review_client(tmp_path)
+    artifact = json.loads(client.workflow.read_text())
+    artifact["status_history"] = [dict(event="historical-approval", planning_review_status="passed", plan_revision=3,
+                                       evidence_ref="historical-approval")]
+    client.workflow.write_text(json.dumps(artifact))
+    historical = artifact["status_history"][:]
+    result = client.call(legacy_import_request(), 2)
+    artifact["review_budget"] = result["projection"]
+    client.workflow.write_text(json.dumps(artifact))
+    ledger_path = Path(result["projection"]["ledger_path"])
+    opening = json.loads(ledger_path.read_text())["opening"]
+    first = funded_legacy_review(client)
+    if correct_contract:
+        client.call(invalid_contract(client, "fresh-review"))
+        cp, retry = correction_requests(client, first, pending=True)
+        client.call(cp)
+        artifact = json.loads(client.workflow.read_text())
+        artifact["plan_input_digest"] = retry["input_digest"]
+        client.workflow.write_text(json.dumps(artifact))
+        client.call(retry)
+        # An old-input PASS cannot be attached to the corrected reservation.
+        stale = client.finish("corrected", "valid", contract_ref="review", contract_digest=digest("review"),
+                              verdict="PASS", review_mode="fresh", reviewed_revision=3,
+                              reviewed_input_digest=first["input_digest"])
+        assert client.call(stale, 3)["reasons"] == ["review_input_mismatch"]
+        first = retry
+    finish = client.finish(first["attempt_id"], "valid", contract_ref="current-findings", contract_digest=digest("findings"),
+                           verdict="FINDINGS", review_mode="fresh", reviewed_revision=3)
+    p = client.call(finish)["projection"]
+    assert client.call(finish)["projection"] == p
+    # Crash before parent ingestion: accounting is durable, historical closure still fails.
+    assert client.call(dict(op="inspect"), 2)["reasons"] == ["fresh_pass_required"]
+    legacy_replay(client, 1)
+    assert client.call(client.reserve("planner", role="planner", source="planner"), 2)["reasons"] == ["fresh_pass_required"]
+    artifact = json.loads(client.workflow.read_text())
+    artifact.update(planning_review_status="findings_received", planning_review_runs=p["counts"]["fresh_valid"],
+                    last_reviewed_revision=3, planning_review_findings=["Synthetic missing requirement"])
+    artifact["results"]["planning_reviewer"] = dict(attempt_id=first["attempt_id"], verdict="FINDINGS",
+                                                       reviewed_input_digest=first["input_digest"])
+    client.workflow.write_text(json.dumps(artifact))
+    client.call(dict(op="inspect"))
+    legacy_replay(client, 0)
+    # Re-ingestion is idempotent: no new finish, history row, count or charge.
+    before = ledger_path.read_bytes()
+    client.workflow.write_text(json.dumps(artifact))
+    assert client.call(finish)["projection"] == p and ledger_path.read_bytes() == before
+    assert artifact["status_history"] == historical
+    assert artifact["planning_review_status"] == "findings_received"
+    assert json.loads(ledger_path.read_text())["opening"] == opening
+    assert (p["counts"]["fresh_valid"], p["counts"]["remediation_attempts"], p["charged_units"]) == (4, 4, 34 if correct_contract else 33)
+    # Spare fresh-only grant units cannot pay for a planner or repair.
+    assert client.call(client.reserve("planner", role="planner", source="planner"), 2)["reasons"] == ["insufficient_eligible_units"]
+    client.call(checkpoint(client, "repair-funds"))
+    client.call(grant("repair-grant", "repair-funds", lane_increments={"remediation": 1},
+                       authorization_scope=dict(subject_id="subject-a", lanes=["work", "remediation"], scope_digest=digest("scope"))))
+    checks = [dict(grant_id="repair-grant", applicable=True, evidence_ref="repair-decision", evidence_digest=digest("authority"))]
+    client.call(client.reserve("planner", role="planner", source="planner", authorization_checks=checks))
+    client.call(client.finish("planner", "valid", contract_ref="revised-plan", contract_digest=digest("revised-plan")))
+    repair = client.reserve("repair", source="repair", lane="remediation", authorization_checks=checks)
+    client.call(repair)
+    evidence = dict(ref="tests", digest=digest("green-output"), input_digest=repair["input_digest"])
+    client.call(client.finish("repair", "valid", contract_ref="repair", contract_digest=digest("repair"), evidence_refs=[evidence]))
+    artifact = json.loads(client.workflow.read_text())
+    artifact.update(planning_review_status="revised_after_review", plan_revision=4)
+    client.workflow.write_text(json.dumps(artifact))
+    proof = dict(**evidence, producer_attempt_id="repair", producer_node_id=repair["node_id"], subject_id="subject-a")
+    client.call(checkpoint(client, "review-funds"))
+    client.call(grant("review-grant", "review-funds", additional_units=0, lane_increments={"fresh": 1},
+                       authorization_scope=dict(subject_id="subject-a", lanes=["fresh"], scope_digest=digest("scope"))))
+    review_checks = [dict(grant_id=g, applicable=True, evidence_ref="review-decision", evidence_digest=digest("authority"))
+                     for g in ("g", "review-grant")]
+    review = client.reserve("final-review", role="plan-gap-reviewer", lane="fresh", content="revised-plan",
+                            retry_of=first["attempt_id"], checkpoint_id="final-proof", dependency_node_ids=[repair["node_id"]],
+                            authorization_checks=review_checks)
+    client.call(checkpoint(client, "final-proof", action="continue", input_digest=review["input_digest"], proof_refs=[proof]))
+    artifact = json.loads(client.workflow.read_text())
+    artifact["plan_input_digest"] = review["input_digest"]
+    client.workflow.write_text(json.dumps(artifact))
+    client.call(review)
+    # FINDINGS/historical approval cannot be relabeled as current approval.
+    artifact = json.loads(client.workflow.read_text())
+    artifact["planning_review_status"] = "passed"
+    client.workflow.write_text(json.dumps(artifact))
+    assert client.call(dict(op="inspect"), 2)["reasons"] == ["fresh_pass_required"]
+    client.call(client.finish("final-review", "valid", contract_ref="final-pass", contract_digest=digest("pass"),
+                              verdict="PASS", review_mode="fresh", reviewed_revision=4))
+    client.call(dict(op="inspect"))
+    legacy_replay(client, 0)
+    final = json.loads(client.workflow.read_text())
+    assert final["status_history"] == historical
+    assert final["review_budget"]["charged_units"] == (40 if correct_contract else 39)
+    assert final["review_budget"]["counts"]["remediation_attempts"] == 5
 
 
 def test_legacy_closure_migration_reports_pending_proof_and_recovers_projection(tmp_path):
@@ -662,6 +1014,12 @@ def test_fifth_code_review_requires_lane_credit_without_extra_units(tmp_path):
     ('and event["lane"] in scope["lanes"]', 'and True', 'scoped_grants_preserve'),
     ('history = [e for e in reserved if e["node_id"] == event["node_id"]]',
      'history = [e for e in reserved if e["phase_id"] == event["phase_id"]]', 'siblings_hold_distinct'),
+    ('if finish is None or finish["outcome"] != "invalid":', 'if finish is None:',
+     'contract_correction_checkpoint_controls and valid-contract_correction_outcome'),
+    ('if any(proof not in checkpoint["proof_refs"] for proof in inherited):', 'if False:',
+     'contract_correction_preserves_covering_proof and missing'),
+    ('e["verdict"] == "PASS"', 'e["verdict"] in ("PASS", "FINDINGS")',
+     'contract_correction_findings_never_close'),
 ])
 def test_negative_controls_falsify_distinct_budget_claims(tmp_path, needle, replacement, scenario):
     source = SCRIPT.read_text()
@@ -670,7 +1028,8 @@ def test_negative_controls_falsify_distinct_budget_claims(tmp_path, needle, repl
     shutil.copy2(SCRIPT.with_name("cc10x_hooklib.py"), tmp_path)
     shutil.copy2(Path(__file__), tmp_path)
     run = subprocess.run([sys.executable, "-m", "pytest", str(tmp_path / Path(__file__).name),
-                          "-q", "-k", scenario], capture_output=True, text=True, cwd=tmp_path, timeout=60)
+                          "-q", "-k", "(%s) and not negative_controls" % scenario],
+                         capture_output=True, text=True, cwd=tmp_path, timeout=60)
     assert run.returncode == 1, run.stdout + run.stderr
     assert "AssertionError" in run.stdout and "ERROR collecting" not in run.stdout, run.stdout
 

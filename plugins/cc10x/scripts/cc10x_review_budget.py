@@ -71,7 +71,21 @@ class Finished(EventHeader):
     measurement: dict
 
 
-class Checkpoint(EventHeader):
+class ContentRef(TypedDict):
+    ref: str
+    digest: str
+
+
+class ContractCorrection(TypedDict):
+    invalid_attempt_id: str
+    instruction: ContentRef
+
+
+class CorrectionFields(TypedDict, total=False):
+    contract_correction: ContractCorrection
+
+
+class Checkpoint(EventHeader, CorrectionFields):
     kind: Literal["checkpoint"]
     checkpoint_id: str
     action: str
@@ -288,6 +302,8 @@ def _event_shape(event: BudgetEvent) -> None:
     expected = set(shape.__annotations__) - {"seq"}
     if event["kind"] == "attempt_reserved":
         expected -= {"reserved_units", "funding", "lane_funding"}
+    if event["kind"] == "checkpoint":
+        expected -= {"contract_correction"}
     if not expected.issubset(event):
         raise BudgetError("missing_event_fields")
     for key in ("event_id", "workflow_uuid", "subject_id"):
@@ -557,6 +573,21 @@ def _reserve(ledger: dict, event: dict) -> None:
             raise BudgetError("unchanged_input", "blocked")
         if event["retry_of"] != prior["attempt_id"]:
             raise BudgetError("invalid_retry")
+    correction = next((e for e in _events(ledger, "checkpoint")
+                       if e["checkpoint_id"] == event["checkpoint_id"] and "contract_correction" in e), None)
+    if correction is not None:
+        prior = _correction_prior(ledger, correction)
+        if ledger["revision"] != correction["observed_revision"] + 1:
+            raise BudgetError("stale_checkpoint", "blocked")
+        if any(event[key] != prior[key] for key in
+               ("node_descriptor", "node_id", "subject_id", "lane", "scope_digest", "dependency_node_ids")):
+            raise BudgetError("contract_correction_identity", "blocked")
+        instruction = correction["contract_correction"]["instruction"]
+        expected_refs = sorted(prior["input_refs"] + [instruction], key=lambda ref: (ref["ref"], ref["digest"]))
+        if sorted(event["input_refs"], key=lambda ref: (ref["ref"], ref["digest"])) != expected_refs:
+            raise BudgetError("contract_correction_input", "blocked")
+    if history:
+        prior = history[-1]
         checkpoints = [e for e in _events(ledger, "checkpoint") if e["checkpoint_id"] == event["checkpoint_id"]]
         if not checkpoints:
             raise BudgetError("retry_checkpoint_required", "blocked")
@@ -566,7 +597,7 @@ def _reserve(ledger: dict, event: dict) -> None:
             raise BudgetError("retry_checkpoint_mismatch", "blocked")
         for proof in checkpoint["proof_refs"]:
             _proof(ledger, proof, [prior["node_id"]] + event["dependency_node_ids"])
-        if event["lane"] in ("fresh", "amendment", "code_review") and not checkpoint["proof_refs"]:
+        if event["lane"] in ("fresh", "amendment", "code_review") and not checkpoint["proof_refs"] and correction is None:
             raise BudgetError("covering_proof_required", "blocked")
     elif event["retry_of"] is not None:
         raise BudgetError("invalid_retry")
@@ -650,6 +681,52 @@ def _checkpoint(ledger: dict, event: dict) -> None:
         raise BudgetError("duplicate_checkpoint")
     for proof in event["proof_refs"]:
         _proof(ledger, proof)
+    if "contract_correction" in event:
+        _correction_prior(ledger, event)
+
+
+def _correction_prior(ledger: dict, checkpoint: dict) -> dict:
+    """Bind the single instruction correction to a terminal receipt and its proof ancestry."""
+    correction = checkpoint["contract_correction"]
+    if not isinstance(correction, dict) or set(correction) != {"invalid_attempt_id", "instruction"}:
+        raise BudgetError("invalid_contract_correction")
+    _id(correction["invalid_attempt_id"])
+    instruction = correction["instruction"]
+    if not isinstance(instruction, dict) or set(instruction) != {"ref", "digest"}:
+        raise BudgetError("invalid_contract_correction")
+    _refs([instruction])
+    reserved = {e["attempt_id"]: e for e in _events(ledger, "attempt_reserved")}
+    prior = reserved.get(correction["invalid_attempt_id"])
+    if prior is None:
+        raise BudgetError("contract_correction_attempt", "blocked")
+    latest = [e for e in reserved.values() if e["node_id"] == prior["node_id"]][-1]
+    if latest != prior:
+        raise BudgetError("contract_correction_attempt", "blocked")
+    finish = next((e for e in _events(ledger, "attempt_finished") if e["attempt_id"] == prior["attempt_id"]), None)
+    if finish is None or finish["outcome"] != "invalid":
+        raise BudgetError("contract_correction_outcome", "blocked")
+    receipt = dict(ref=_text(finish["contract_ref"]), digest=_sha(finish["contract_digest"]))
+    if (receipt not in checkpoint["changed_input_refs"] or instruction not in checkpoint["changed_input_refs"] or
+            instruction == receipt or
+            any(all(ref[key] == instruction[key] for key in ("ref", "digest")) for ref in prior["input_refs"])):
+        raise BudgetError("contract_correction_evidence", "blocked")
+    if (checkpoint["action"] != "continue" or checkpoint["subject_id"] != prior["subject_id"] or
+            checkpoint["scope_digest"] != prior["scope_digest"]):
+        raise BudgetError("contract_correction_identity", "blocked")
+    checkpoints = {e["checkpoint_id"]: e for e in _events(ledger, "checkpoint")}
+    ancestor = prior
+    while ancestor is not None:
+        previous = checkpoints.get(ancestor["checkpoint_id"])
+        if previous is not None and "contract_correction" in previous:
+            raise BudgetError("contract_correction_used", "blocked")
+        ancestor = reserved.get(ancestor["retry_of"])
+    previous = checkpoints.get(prior["checkpoint_id"])
+    inherited = previous["proof_refs"] if previous is not None else []
+    if any(proof not in checkpoint["proof_refs"] for proof in inherited):
+        raise BudgetError("covering_proof_required", "blocked")
+    for proof in checkpoint["proof_refs"]:
+        _proof(ledger, proof, [prior["node_id"]] + prior["dependency_node_ids"])
+    return prior
 
 
 def _proof(ledger: dict, proof: dict, nodes: Optional[list] = None) -> None:
